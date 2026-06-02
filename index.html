@@ -10,12 +10,20 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
   <title>SplitTrip</title>
 
+  <!-- Preload heavy dependencies so the browser fetches them in parallel
+       with HTML parsing rather than waiting for the parser to reach the
+       script tags in body. No effect after first visit (cached). -->
+  <link rel="preload" as="script" href="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin />
+  <link rel="preload" as="script" href="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin />
+  <link rel="preload" as="script" href="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin />
+
   <!-- Fonts -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
 
-  <!-- Icons -->
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" />
+  <!-- Icons — base (font-face) + solid only; avoids loading all 6 icon sets -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/fontawesome.min.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/solid.min.css" />
 
   <!-- Tailwind -->
   <script src="https://cdn.tailwindcss.com"></script>
@@ -91,13 +99,6 @@
 <body class="min-h-screen">
   <div id="root"></div>
 
-  <!-- Preload heavy dependencies so the browser fetches them in parallel
-       with HTML parsing rather than waiting for the parser to reach the
-       script tags below. No effect after first visit (cached). -->
-  <link rel="preload" as="script" href="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin />
-  <link rel="preload" as="script" href="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin />
-  <link rel="preload" as="script" href="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin />
-
   <!-- Dependencies -->
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
@@ -124,15 +125,17 @@
 
     // Ping Supabase to keep connection warm (free tier sleeps when idle)
     const pingSupabase = () => fetch(`${SUPABASE_URL}/rest/v1/`, {
+      method: 'HEAD',
       headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` }
     }).catch(() => {});
 
-    // Ping on load, on tab focus, and every 30s to prevent idle sleep
+    // Ping on load and on tab focus to keep connection warm.
+    // The 30s interval was removed — withTimeout + resetConnection handles
+    // cold connections reactively, making the background interval redundant.
     pingSupabase();
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') pingSupabase();
     });
-    const _pingInterval = setInterval(pingSupabase, 30000);
 
     // Recreates the Supabase client — clears zombie connections the same way
     // a page refresh would, without losing the user's form data.
@@ -211,12 +214,26 @@
     // ══════════════════════════════════════════════════
     // Cache entire base-currency response to minimise API calls
     // e.g. 5 EUR expenses → only 1 fetch for eur@2025-01-10
+    // Max 100 entries — evicts oldest when full (normal session: ~10-20 entries)
     const _ratesCache = {};
+    let _ratesCacheKeys = [];
 
     // Cache settlement results by trip ID so switching back to the Settle Up
     // tab shows the previous result immediately instead of flashing a spinner.
-    // Keyed as `tripId:currency`. Cleared automatically when the page reloads.
+    // Keyed as `tripId:currency`. Max 20 entries.
     const _settleCache = {};
+    let _settleCacheKeys = [];
+
+    function cacheSet(cache, keys, key, value, max) {
+      if (!cache[key]) {
+        keys.push(key);
+        if (keys.length > max) {
+          const evict = keys.shift();
+          delete cache[evict];
+        }
+      }
+      cache[key] = value;
+    }
 
     async function getRate(from, to, date) {
       if (from === to) return 1;
@@ -232,7 +249,7 @@
         const res = await fetch(url);
         if (!res.ok) throw new Error(`Rate API returned ${res.status}`);
         const data = await res.json();
-        _ratesCache[cacheKey] = data[fromL];
+        cacheSet(_ratesCache, _ratesCacheKeys, cacheKey, data[fromL], 100);
       }
 
       const rate = _ratesCache[cacheKey]?.[toL];
@@ -307,24 +324,33 @@
     }
 
     async function fetchProfile(userId) {
-      const { data } = await db.from('profiles').select('*').eq('id', userId).single();
-      return data;
+      try {
+        const { data, error } = await withTimeout(() => db
+          .from('profiles').select('*').eq('id', userId).single());
+        if (error) { logErr('fetchProfile', error); }
+        return data;
+      } catch(e) {
+        logErr('fetchProfile', e);
+        return null; // Profile is supplementary — don't block login on failure
+      }
     }
 
     async function fetchTrips() {
-      // RLS automatically filters to trips the current user is a member of
-      const { data, error } = await db
+      // RLS automatically filters to trips the current user is a member of.
+      // We fetch only created_at from expenses (not full rows) purely for
+      // sort-by-last-activity. TripView fetches its own expenses separately.
+      const { data, error } = await withTimeout(() => db
         .from('trips')
-        .select('*, trip_members(id, name, user_id), expenses(created_at)');
+        .select('*, trip_members(id, name, user_id), expenses(created_at)'));
       if (error) { logErr('fetchTrips', error); throw error; }
       if (!data) return [];
       // Sort by most recent expense date, falling back to trip creation date
       return data.sort((a, b) => {
         const aLast = a.expenses?.length
-          ? Math.max(...a.expenses.map(e => new Date(e.created_at).getTime()))
+          ? a.expenses.reduce((max, e) => Math.max(max, new Date(e.created_at).getTime()), 0)
           : new Date(a.created_at).getTime();
         const bLast = b.expenses?.length
-          ? Math.max(...b.expenses.map(e => new Date(e.created_at).getTime()))
+          ? b.expenses.reduce((max, e) => Math.max(max, new Date(e.created_at).getTime()), 0)
           : new Date(b.created_at).getTime();
         return bLast - aLast;
       });
@@ -341,20 +367,21 @@
     }
 
     async function fetchExpenses(tripId) {
-      const { data: expenses, error } = await db
+      const { data: expenses, error } = await withTimeout(() => db
         .from('expenses')
         .select('*')
         .eq('trip_id', tripId)
         .order('date', { ascending: false })
-        .order('created_at', { ascending: false });
+        .order('created_at', { ascending: false }));
       if (error) throw error;
       if (!expenses?.length) return [];
 
       // Fetch splits separately to avoid RLS issues with nested selects
-      const { data: splits } = await db
+      const { data: splits, error: se } = await withTimeout(() => db
         .from('expense_splits')
         .select('*')
-        .in('expense_id', expenses.map(e => e.id));
+        .in('expense_id', expenses.map(e => e.id)));
+      if (se) { logErr('fetchExpenses:splits', se); throw se; }
 
       return expenses.map(e => ({
         ...e,
@@ -439,12 +466,10 @@
     }
 
     async function updateProfileName(userId, name) {
-      // Update profile table
-      const { error } = await withTimeout(() => db.from('profiles').update({ name }).eq('id', userId));
-      if (error) { logErr('updateProfile', error); throw error; }
-      // Also update all trip_members rows for this user so everyone sees the new name
-      const { error: me } = await withTimeout(() => db.from('trip_members').update({ name }).eq('user_id', userId));
-      if (me) { logErr('updateMemberName', me); throw me; }
+      // Single atomic RPC — updates both profiles and trip_members in one
+      // transaction so a dropped connection can never leave them out of sync.
+      const { error } = await withTimeout(() => db.rpc('update_profile_name', { new_name: name }));
+      if (error) { logErr('updateProfileName', error); throw error; }
     }
 
     // ══════════════════════════════════════════════════
@@ -470,6 +495,15 @@
       });
 
     const todayISO = () => new Date().toISOString().split('T')[0];
+
+    // Amount formatting — used by AddExpenseModal for comma-separated display
+    const fmtAmt = (str) => {
+      const clean = String(str).replace(/[^0-9.]/g, '');
+      const [int, dec] = clean.split('.');
+      const intFmt = (int || '').replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+      return dec !== undefined ? `${intFmt}.${dec}` : intFmt;
+    };
+    const parseAmt = (str) => parseFloat(String(str).replace(/,/g, '')) || 0;
 
     const PALETTE = [
       '#C8964C','#3D8B5E','#4A7FB5','#A0522D','#7B68EE',
@@ -609,7 +643,13 @@
       );
     }
 
-    function Toast({ message, type = 'error' }) {
+    function Toast({ message, type = 'error', autoDismiss, onDismiss }) {
+      useEffect(() => {
+        if (autoDismiss && onDismiss) {
+          const t = setTimeout(onDismiss, autoDismiss);
+          return () => clearTimeout(t);
+        }
+      }, [autoDismiss, onDismiss]);
       const bg = type === 'error' ? 'bg-rose-light text-rose border-rose/20' : 'bg-moss-light text-moss border-moss/20';
       return (
         <div className={`flex items-center gap-2 px-3 py-2.5 rounded-xl border text-sm ${bg}`}>
@@ -805,7 +845,7 @@
               </div>
 
               {err && <div className="mt-3"><Toast message={err} /></div>}
-              {ok  && <div className="mt-3"><Toast message={ok} type="success" /></div>}
+              {ok  && <div className="mt-3"><Toast message={ok} type="success" autoDismiss={8000} onDismiss={() => setOk('')} /></div>}
 
               <Btn variant="gold" full loading={loading} className="mt-4" onClick={submit}>
                 {mode === 'login' ? 'Sign In' : mode === 'register' ? 'Create Account' : 'Send Reset Link'}
@@ -915,7 +955,7 @@
                 value={confirmPass} onChange={e => setConfirm(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && changePassword()} />
               {passErr && <Toast message={passErr} />}
-              {passOk  && <Toast message={passOk} type="success" />}
+              {passOk  && <Toast message={passOk} type="success" autoDismiss={3000} onDismiss={() => setPassOk('')} />}
               <Btn variant="gold" full loading={savingPass} onClick={changePassword}>
                 Update Password
               </Btn>
@@ -932,6 +972,9 @@
                 <button onClick={() => { window._errLog = []; setLogVersion(v => v + 1); }}
                   className="text-xs text-muted hover:text-ink transition">Clear</button>
               </div>
+              {/* logVersion is incremented by Clear so React re-renders and reads
+                  the now-empty window._errLog. The >= 0 is always true — it exists
+                  solely to create a render dependency on logVersion. */}
               {(logVersion >= 0) && (!window._errLog || window._errLog.length === 0) ? (
                 <div className="text-center py-8 bg-parchment rounded-xl">
                   <i className="fa-solid fa-circle-check text-moss text-xl mb-2" />
@@ -995,17 +1038,19 @@
       const [editName, setEditName]   = useState('');
       const [savingName, setSavingName] = useState(false);
 
+      const [nameErr, setNameErr] = useState('');
       const [showAccount, setShowAccount] = useState(false);
-      const startEditName = () => { setEditName(profile?.name || ''); setEditingName(true); };
-      const cancelEditName = () => setEditingName(false);
+      const startEditName = () => { setEditName(profile?.name || ''); setEditingName(true); setNameErr(''); };
+      const cancelEditName = () => { setEditingName(false); setNameErr(''); };
       const saveNameChange = async () => {
         if (!editName.trim()) return;
         setSavingName(true);
+        setNameErr('');
         try {
           await updateProfileName(user.id, editName.trim());
           setProfile(p => ({ ...p, name: editName.trim() }));
           setEditingName(false);
-        } catch(e) { alert(e?.message || 'Could not save name.'); }
+        } catch(e) { setNameErr(e?.message || 'Could not save name.'); }
         setSavingName(false);
       };
 
@@ -1037,21 +1082,24 @@
               </button>
               <div className="flex items-center gap-2">
                 {editingName ? (
-                  <div className="flex items-center gap-1.5">
-                    <input
-                      autoFocus
-                      value={editName}
-                      onChange={e => setEditName(e.target.value)}
-                      onKeyDown={e => { if (e.key === 'Enter') saveNameChange(); if (e.key === 'Escape') cancelEditName(); }}
-                      className="w-28 px-2 py-1 bg-cream/10 border border-cream/20 rounded-lg text-xs text-cream focus:outline-none focus:border-gold/60"
-                    />
-                    <button onClick={saveNameChange} disabled={savingName}
-                      className="text-gold hover:text-gold-light transition text-xs disabled:opacity-50">
-                      {savingName ? <Spinner /> : <i className="fa-solid fa-check" />}
-                    </button>
-                    <button onClick={cancelEditName} className="text-cream/40 hover:text-cream transition text-xs">
-                      <i className="fa-solid fa-xmark" />
-                    </button>
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        autoFocus
+                        value={editName}
+                        onChange={e => setEditName(e.target.value)}
+                        onKeyDown={e => { if (e.key === 'Enter') saveNameChange(); if (e.key === 'Escape') cancelEditName(); }}
+                        className="w-28 px-2 py-1 bg-cream/10 border border-cream/20 rounded-lg text-xs text-cream focus:outline-none focus:border-gold/60"
+                      />
+                      <button onClick={saveNameChange} disabled={savingName}
+                        className="text-gold hover:text-gold-light transition text-xs disabled:opacity-50">
+                        {savingName ? <Spinner /> : <i className="fa-solid fa-check" />}
+                      </button>
+                      <button onClick={cancelEditName} className="text-cream/40 hover:text-cream transition text-xs">
+                        <i className="fa-solid fa-xmark" />
+                      </button>
+                    </div>
+                    {nameErr && <Toast message={nameErr} />}
                   </div>
                 ) : (
                   <button onClick={startEditName}
@@ -1065,7 +1113,6 @@
                   <i className="fa-solid fa-gear text-sm" />
                 </button>
                 <button onClick={() => {
-                    clearInterval(_pingInterval);      // stop keepalive pings
                     db.auth.signOut().catch(() => {}); // fire and forget — server cleanup
                     localStorage.clear();              // clear session immediately
                     window.location.reload();
@@ -1323,8 +1370,9 @@
           <div className="bg-ink text-cream sticky top-0 z-20">
             <div className="max-w-lg mx-auto px-4">
               <div className="flex items-center gap-3 pt-4 pb-3">
-                <button onClick={() => window.location.reload()}
-                  className="flex items-center justify-center hover:opacity-80 transition active:scale-95 -ml-1">
+                <button onClick={onBack}
+                  className="flex items-center justify-center hover:opacity-80 transition active:scale-95 -ml-1"
+                  title="Back to trips">
                   <div className="w-8 h-8 bg-gold rounded-lg flex items-center justify-center">
                     <i className="fa-solid fa-receipt text-white text-sm" />
                   </div>
@@ -1352,7 +1400,7 @@
                         <button onClick={async () => {
                           setDeletingTrip(true);
                           try { await deleteTripById(trip.id); onBack(); }
-                          catch(e) { alert('Delete failed: ' + (e?.message||'error')); setDeletingTrip(false); setConfirmDelTrip(false); }
+                          catch(e) { setLoadError(e?.message || 'Delete failed.'); setDeletingTrip(false); setConfirmDelTrip(false); }
                         }} disabled={deletingTrip} className="text-xs font-semibold text-rose-300 hover:text-white transition">
                           {deletingTrip ? <Spinner /> : 'Yes'}
                         </button>
@@ -1443,14 +1491,15 @@
       const [editExp, setEdit]  = useState(null);
       const [deleting, setDel]  = useState(null);
       const [confirmDel, setConf] = useState(null);
+      const [deleteErr, setDeleteErr] = useState('');
 
       const memberIdx  = (id) => members.findIndex(m => m.id === id);
       const memberName = (id) => members.find(m => m.id === id)?.name || 'Unknown';
 
       const handleDelete = async (id) => {
-        setDel(id); setConf(null);
+        setDel(id); setConf(null); setDeleteErr('');
         try { await removeExpense(id); await onRefresh(); }
-        catch (e) { alert('Delete failed: ' + (e?.message || 'Unknown error')); setDel(null); }
+        catch (e) { setDeleteErr(e?.message || 'Delete failed.'); setDel(null); }
       };
 
       // Group by date
@@ -1515,6 +1564,12 @@
                   </div>
                 </div>
               ))}
+            </div>
+          )}
+
+          {deleteErr && (
+            <div className="fixed bottom-24 inset-x-4 z-30">
+              <Toast message={deleteErr} />
             </div>
           )}
 
@@ -1654,15 +1709,6 @@
     // ══════════════════════════════════════════════════
     function AddExpenseModal({ trip, members, user, editExpense, onAdded, onClose }) {
       const isEdit = !!editExpense;
-
-      // ── Amount formatting helpers ──
-      const fmtAmt = (str) => {
-        const clean = String(str).replace(/[^0-9.]/g, '');
-        const [int, dec] = clean.split('.');
-        const intFmt = (int || '').replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-        return dec !== undefined ? `${intFmt}.${dec}` : intFmt;
-      };
-      const parseAmt = (str) => parseFloat(String(str).replace(/,/g, '')) || 0;
 
       const [desc, setDesc]       = useState(editExpense?.description || '');
       const [amount, setAmt]      = useState(editExpense ? fmtAmt(editExpense.amount) : '');
@@ -1818,8 +1864,9 @@
         return out;
       }, [total, equalSet, members]);
 
-      // Fix 2: auto-distribute remaining % DOWNWARD only
-      // People above the changed field are never touched
+      // Percentage mode: when a field changes, redistribute the remaining %
+      // across members BELOW the changed field only. Members above are never touched,
+      // so editing from top to bottom gives predictable control.
       const handlePercentChange = (memberId, newVal) => {
         const idx = members.findIndex(m => m.id === memberId);
         const newPercs = { ...percents, [memberId]: newVal };
@@ -2135,7 +2182,7 @@
         setRateError('');
         try {
           const r = await computeSettlements(expenses, members, currency);
-          _settleCache[key] = r;
+          cacheSet(_settleCache, _settleCacheKeys, key, r, 20);
           setResult(r);
         } catch(e) {
           setRateError(e.message || 'Could not fetch exchange rates.');
@@ -2262,11 +2309,14 @@
       const [editErr, setEditErr]       = useState('');
       const [confirmRemove, setConfirm] = useState(null);
       const [removing, setRemoving]     = useState(null);
+      const [removeErr, setRemoveErr]   = useState('');
 
       const startEdit = (m) => { setEditingId(m.id); setEditName(m.name); setEditErr(''); };
       const cancelEdit = () => { setEditingId(null); setEditErr(''); };
 
       const saveEdit = async (m) => {
+        // m is passed for context but name edits are always for the current user —
+        // the edit button is only rendered for m.user_id === user.id.
         if (!editName.trim()) { setEditErr('Name cannot be empty.'); return; }
         setSaving(true);
         try {
@@ -2278,16 +2328,16 @@
       };
 
       const handleRemove = async (m) => {
-        setRemoving(m.id); setConfirm(null);
+        setRemoving(m.id); setConfirm(null); setRemoveErr('');
         try {
           await removeMemberFromTrip(m.id);
           await onRefresh();
         } catch(e) {
           const msg = e?.message || '';
           if (msg.includes('foreign key') || msg.includes('violates')) {
-            alert(`${m.name} can't be removed because they have expenses recorded against them. Delete their expenses first.`);
+            setRemoveErr(`${m.name} can't be removed because they have expenses recorded against them. Delete their expenses first.`);
           } else {
-            alert(msg || 'Could not remove member.');
+            setRemoveErr(msg || 'Could not remove member.');
           }
         }
         setRemoving(null);
@@ -2345,6 +2395,7 @@
               )}
             </div>
           ))}
+          {removeErr && <div className="mt-2"><Toast message={removeErr} /></div>}
         </>
       );
     }
@@ -2525,7 +2576,7 @@
                 value={confirmPass} onChange={e => setConfirm(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && submit()} />
               {err && <Toast message={err} />}
-              {ok  && <Toast message={ok} type="success" />}
+              {ok  && <Toast message={ok} type="success" autoDismiss={2500} onDismiss={() => setOk('')} />}
               <Btn variant="gold" full loading={loading} onClick={submit}>
                 Update Password
               </Btn>
