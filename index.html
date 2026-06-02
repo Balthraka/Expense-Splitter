@@ -726,9 +726,9 @@
       }, [onSignIn]);
 
       if (booting) return (
-        <div className="min-h-screen flex items-center justify-center">
-          <div className="text-center">
-            <div className="w-10 h-10 rounded-2xl bg-ink flex items-center justify-center mx-auto mb-4">
+        <div className="min-h-screen flex flex-col items-center justify-center">
+          <div className="flex flex-col items-center gap-4">
+            <div className="w-10 h-10 rounded-2xl bg-ink flex items-center justify-center">
               <i className="fa-solid fa-receipt text-cream" />
             </div>
             <Spinner dark />
