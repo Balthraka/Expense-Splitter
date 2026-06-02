@@ -91,6 +91,13 @@
 <body class="min-h-screen">
   <div id="root"></div>
 
+  <!-- Preload heavy dependencies so the browser fetches them in parallel
+       with HTML parsing rather than waiting for the parser to reach the
+       script tags below. No effect after first visit (cached). -->
+  <link rel="preload" as="script" href="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin />
+  <link rel="preload" as="script" href="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin />
+  <link rel="preload" as="script" href="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin />
+
   <!-- Dependencies -->
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
@@ -186,7 +193,7 @@
     };
 
     // ══════════════════════════════════════════════════
-    // 💱  CURRENCIES  (supported by frankfurter.app)
+    // 💱  CURRENCIES  (supported by fawazahmed0/currency-api via jsDelivr)
     // ══════════════════════════════════════════════════
     const CURRENCIES = [
       'AED','ALL','AMD','ARS','AUD','AZN','BDT','BGN','BHD','BND',
@@ -197,7 +204,7 @@
       'NOK','NPR','NZD','OMR','PEN','PHP','PKR','PLN','QAR','RON',
       'RSD','SAR','SEK','SGD','THB','TRY','TWD','TZS','UAH','UGX',
       'USD','UYU','VND','ZAR',
-    ].filter((v, i, a) => a.indexOf(v) === i).sort();
+    ].sort();
 
     // ══════════════════════════════════════════════════
     // 🔄  EXCHANGE RATE  (cached, historical by date)
@@ -205,6 +212,11 @@
     // Cache entire base-currency response to minimise API calls
     // e.g. 5 EUR expenses → only 1 fetch for eur@2025-01-10
     const _ratesCache = {};
+
+    // Cache settlement results by trip ID so switching back to the Settle Up
+    // tab shows the previous result immediately instead of flashing a spinner.
+    // Keyed as `tripId:currency`. Cleared automatically when the page reloads.
+    const _settleCache = {};
 
     async function getRate(from, to, date) {
       if (from === to) return 1;
@@ -291,7 +303,7 @@
     // 🗄️  DATABASE HELPERS
     // ══════════════════════════════════════════════════
     async function claimMemberships() {
-      try { await db.rpc('claim_memberships'); } catch {}
+      try { await withTimeout(() => db.rpc('claim_memberships')); } catch (e) { logErr('claimMemberships', e); }
     }
 
     async function fetchProfile(userId) {
@@ -301,9 +313,10 @@
 
     async function fetchTrips() {
       // RLS automatically filters to trips the current user is a member of
-      const { data } = await db
+      const { data, error } = await db
         .from('trips')
         .select('*, trip_members(id, name, user_id), expenses(created_at)');
+      if (error) { logErr('fetchTrips', error); throw error; }
       if (!data) return [];
       // Sort by most recent expense date, falling back to trip creation date
       return data.sort((a, b) => {
@@ -318,11 +331,12 @@
     }
 
     async function fetchTripMembers(tripId) {
-      const { data } = await db
+      const { data, error } = await db
         .from('trip_members')
         .select('*')
         .eq('trip_id', tripId)
         .order('created_at');
+      if (error) { logErr('fetchTripMembers', error); throw error; }
       return data || [];
     }
 
@@ -387,7 +401,7 @@
         member_id: s.memberId,
         amount: s.amount,
       }));
-      const { error: se } = await db.from('expense_splits').insert(splitRows);
+      const { error: se } = await withTimeout(() => db.from('expense_splits').insert(splitRows));
       if (se) { logErr('saveExpense:splits', se); throw se; }
       return exp;
     }
@@ -402,11 +416,11 @@
     async function updateExpenseRecord(expenseId, expenseData, splits) {
       const { error } = await withTimeout(() => db.from('expenses').update(expenseData).eq('id', expenseId));
       if (error) { logErr('updateExpense', error); throw error; }
-      const { error: de } = await db.from('expense_splits').delete().eq('expense_id', expenseId);
-      if (de) throw de;
+      const { error: de } = await withTimeout(() => db.from('expense_splits').delete().eq('expense_id', expenseId));
+      if (de) { logErr('updateExpense:splits:delete', de); throw de; }
       const splitRows = splits.map(s => ({ expense_id: expenseId, member_id: s.memberId, amount: s.amount }));
-      const { error: se } = await db.from('expense_splits').insert(splitRows);
-      if (se) throw se;
+      const { error: se } = await withTimeout(() => db.from('expense_splits').insert(splitRows));
+      if (se) { logErr('updateExpense:splits:insert', se); throw se; }
     }
 
     async function removeMemberFromTrip(memberId) {
@@ -464,6 +478,16 @@
     ];
 
     function memberColor(idx) { return PALETTE[idx % PALETTE.length]; }
+
+    // Derives a stable palette index from a trip UUID so the card colour
+    // never changes as the sort order shifts with new activity.
+    function tripColorIdx(id) {
+      if (!id) return 0;
+      const hex = id.replace(/-/g, '');
+      let n = 0;
+      for (let i = 0; i < 8; i++) n += parseInt(hex[i], 16);
+      return n % PALETTE.length;
+    }
 
     function Avatar({ name = '?', idx = 0, size = 'md', className = '' }) {
       const initials = name.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
@@ -528,6 +552,28 @@
       );
     }
 
+    // Auto-resizing textarea — grows with content, never shows a scrollbar.
+    // Uses useLayoutEffect so the height update happens before paint (no flicker).
+    function TextArea({ label, hint, minRows = 2, ...props }) {
+      const ref = useRef(null);
+      useLayoutEffect(() => {
+        const el = ref.current;
+        if (!el) return;
+        el.style.height = 'auto';
+        el.style.height = el.scrollHeight + 'px';
+      }, [props.value]);
+      return (
+        <Field label={label} hint={hint}>
+          <textarea
+            ref={ref}
+            rows={minRows}
+            className={inputCls + ' resize-none overflow-hidden leading-relaxed'}
+            {...props}
+          />
+        </Field>
+      );
+    }
+
     function SelectInput({ label, hint, children, ...props }) {
       return (
         <Field label={label} hint={hint}>
@@ -581,8 +627,14 @@
       const [profile, setProfile] = useState(null);
       const [booting, setBooting] = useState(true);
       const [selectedTrip, setSelectedTrip] = useState(null);
+      const [passwordRecovery, setPasswordRecovery] = useState(false);
+      // Guards against onSignIn being called twice on boot: once via getSession()
+      // and once via onAuthStateChange firing SIGNED_IN for the existing session.
+      const hasSignedIn = useRef(false);
 
       const onSignIn = useCallback(async (u) => {
+        if (hasSignedIn.current) return;
+        hasSignedIn.current = true;
         setUser(u);
         await claimMemberships();
         const p = await fetchProfile(u.id);
@@ -591,6 +643,27 @@
 
       useEffect(() => {
         const timeout = setTimeout(() => setBooting(false), 4000);
+
+        // ── Password recovery: detectSessionInUrl is false, so we manually
+        // parse the URL hash that Supabase appends to the reset-email link.
+        // Format: #access_token=...&refresh_token=...&type=recovery
+        const hashParams = new URLSearchParams(window.location.hash.slice(1));
+        if (hashParams.get('type') === 'recovery') {
+          const accessToken  = hashParams.get('access_token');
+          const refreshToken = hashParams.get('refresh_token') || '';
+          if (accessToken) {
+            clearTimeout(timeout);
+            // Clean the tokens out of the URL immediately
+            window.history.replaceState(null, '', window.location.pathname);
+            db.auth.setSession({ access_token: accessToken, refresh_token: refreshToken })
+              .finally(() => { setPasswordRecovery(true); setBooting(false); });
+            const { data: { subscription } } = db.auth.onAuthStateChange(async (event, session) => {
+              if (event === 'SIGNED_IN' && session?.user) await onSignIn(session.user);
+              if (event === 'SIGNED_OUT') { setUser(null); setProfile(null); setSelectedTrip(null); }
+            });
+            return () => subscription.unsubscribe();
+          }
+        }
 
         db.auth.getSession()
           .then(async ({ data: { session } }) => {
@@ -621,6 +694,15 @@
             <Spinner dark />
           </div>
         </div>
+      );
+
+      if (passwordRecovery) return (
+        <PasswordRecoveryView onDone={() => {
+          setPasswordRecovery(false);
+          db.auth.signOut().catch(() => {});
+          localStorage.clear();
+          window.location.reload();
+        }} />
       );
 
       if (!user) return <AuthView onAuth={onSignIn} />;
@@ -753,6 +835,8 @@
       const [deleteConfirm, setDeleteConfirm] = useState('');
       const [deletingAcct, setDeletingAcct]   = useState(false);
       const [deleteErr, setDeleteErr] = useState('');
+      // Incrementing this forces the error log section to re-render after Clear
+      const [logVersion, setLogVersion] = useState(0);
 
       const changePassword = async () => {
         setPassErr(''); setPassOk('');
@@ -845,10 +929,10 @@
               </button>
               <div className="flex items-center justify-between">
                 <p className="text-xs font-semibold text-muted uppercase tracking-widest">Recent errors</p>
-                <button onClick={() => { window._errLog = []; }}
+                <button onClick={() => { window._errLog = []; setLogVersion(v => v + 1); }}
                   className="text-xs text-muted hover:text-ink transition">Clear</button>
               </div>
-              {(!window._errLog || window._errLog.length === 0) ? (
+              {(logVersion >= 0) && (!window._errLog || window._errLog.length === 0) ? (
                 <div className="text-center py-8 bg-parchment rounded-xl">
                   <i className="fa-solid fa-circle-check text-moss text-xl mb-2" />
                   <p className="text-sm text-muted">No errors recorded</p>
@@ -1030,7 +1114,7 @@
             ) : (
               <div className="space-y-3">
                 {trips.map((trip, i) => (
-                  <TripCard key={trip.id} trip={trip} idx={i} onClick={() => onSelectTrip(trip)} />
+                  <TripCard key={trip.id} trip={trip} onClick={() => onSelectTrip(trip)} />
                 ))}
               </div>
             )}
@@ -1047,14 +1131,15 @@
       );
     }
 
-    function TripCard({ trip, idx, onClick }) {
+    function TripCard({ trip, onClick }) {
       const members = trip.trip_members || [];
+      const colorIdx = tripColorIdx(trip.id);
       return (
         <button onClick={onClick}
           className="w-full bg-white rounded-2xl border border-ink/8 p-4 text-left hover:border-gold/40 hover:shadow-md transition-all active:scale-[0.99] fade-up">
           <div className="flex items-start gap-3">
             <div className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
-              style={{ background: memberColor(idx), opacity: 0.85 }}>
+              style={{ background: memberColor(colorIdx), opacity: 0.85 }}>
               <i className="fa-solid fa-plane text-white text-sm" />
             </div>
             <div className="flex-1 min-w-0">
@@ -1122,7 +1207,7 @@
         <Modal title="Create New Trip" onClose={onClose} wide>
           <div className="space-y-4">
             <TextInput label="Trip name *" placeholder="Italy 2025, Japan Trip, Vegas Weekend…" value={name} onChange={e => setName(e.target.value)} />
-            <TextInput label="Description" placeholder="Optional note about the trip" value={desc} onChange={e => setDesc(e.target.value)} />
+            <TextArea label="Description" placeholder="Optional note about the trip" value={desc} onChange={e => setDesc(e.target.value)} minRows={2} />
             <div className="grid grid-cols-2 gap-3">
               <SelectInput label="Default expense currency" value={expCurr} onChange={e => setExpCurr(e.target.value)}>
                 {CURRENCIES.map(c => <option key={c}>{c}</option>)}
@@ -1196,6 +1281,8 @@
       const [showEditTrip, setEditTrip] = useState(false);
       const [confirmDelTrip, setConfirmDelTrip] = useState(false);
       const [deletingTrip, setDeletingTrip] = useState(false);
+      const [showAccount, setShowAccount] = useState(false);
+      const [showDesc, setShowDesc] = useState(false);
       const isCreator = trip.created_by === user.id;
 
       const load = useCallback(async () => {
@@ -1244,7 +1331,14 @@
                 </button>
                 <button onClick={load} className="flex-1 min-w-0 text-left hover:opacity-80 transition active:scale-95">
                   <h1 className="font-bold truncate tracking-tight">{trip.name}</h1>
-                  <p className="text-xs text-cream/40 mt-0.5">{members.length} people · {trip.base_currency}</p>
+                  <p className="text-xs text-cream/40 mt-0.5">
+                    {loading ? '…' : `${members.length} people`} · {trip.base_currency}
+                  </p>
+                </button>
+                {/* Gear icon — always visible, not just for creators */}
+                <button onClick={() => setShowAccount(true)}
+                  className="w-8 h-8 flex items-center justify-center rounded-xl hover:bg-cream/10 transition text-cream/50 hover:text-cream" title="Account settings">
+                  <i className="fa-solid fa-gear text-xs" />
                 </button>
                 {isCreator && (
                   <div className="flex items-center gap-1">
@@ -1273,6 +1367,16 @@
                   </div>
                 )}
               </div>
+              {/* Trip description — shown as a tappable strip if set */}
+              {trip.description ? (
+                <button onClick={() => setShowDesc(d => !d)}
+                  className="w-full text-left py-2 flex items-start gap-1.5 group">
+                  <p className={`text-xs text-cream/50 flex-1 ${showDesc ? 'break-words whitespace-pre-wrap' : 'truncate'}`}>
+                    {trip.description}
+                  </p>
+                  <i className={`fa-solid fa-chevron-down text-cream/30 text-xs flex-shrink-0 mt-0.5 transition-transform group-hover:text-cream/50 ${showDesc ? 'rotate-180' : ''}`} />
+                </button>
+              ) : null}
               <div className="flex gap-1 -mb-px">
                 {TABS.map(t => (
                   <button key={t.key} onClick={() => setTab(t.key)}
@@ -1291,6 +1395,10 @@
             <EditTripModal trip={trip}
               onSaved={updated => { setTrip(updated); setEditTrip(false); }}
               onClose={() => setEditTrip(false)} />
+          )}
+
+          {showAccount && (
+            <AccountModal user={user} onClose={() => setShowAccount(false)} />
           )}
 
           {/* Content */}
@@ -1485,7 +1593,7 @@
             <div className="flex items-center gap-3">
               <Avatar name={payer} idx={payerIdx} />
               <div className="flex-1 min-w-0">
-                <p className="font-bold text-ink truncate">{expense.description}</p>
+                <p className={`font-bold text-ink ${open ? 'break-words' : 'truncate'}`}>{expense.description}</p>
                 <p className="text-xs text-muted mt-0.5">{payer} paid · {fmtDate(expense.date)}</p>
                 {splitSummary && <p className="text-xs text-muted/85 mt-0.5">{splitSummary}</p>}
                 {addedBy && <p className="text-xs text-muted/65 mt-0.5">Added by {addedBy}</p>}
@@ -1685,8 +1793,14 @@
         cursorRef.current = newPos;
         setAmt(formatted);
       };
-      const pctTotal = Object.values(percents).reduce((s, v) => s + (parseFloat(v) || 0), 0);
-      const exTotal  = Object.values(exacts).reduce((s, v) => s + (parseFloat(String(v).replace(/,/g,'')) || 0), 0);
+      const pctTotal = useMemo(
+        () => Object.values(percents).reduce((s, v) => s + (parseFloat(v) || 0), 0),
+        [percents]
+      );
+      const exTotal = useMemo(
+        () => Object.values(exacts).reduce((s, v) => s + (parseFloat(String(v).replace(/,/g, '')) || 0), 0),
+        [exacts]
+      );
 
       // Compute actual equal-split amounts including last-person rounding remainder
       const equalAmounts = useMemo(() => {
@@ -1842,7 +1956,7 @@
       return (
         <Modal title={isEdit ? "Edit Expense" : "Add Expense"} onClose={onClose} wide>
           <div className="space-y-4">
-            <TextInput label="Description *" placeholder="Dinner, train tickets, hotel deposit…" value={desc} onChange={e => setDesc(e.target.value)} />
+            <TextArea label="Description *" placeholder="Dinner, train tickets, hotel deposit…" value={desc} onChange={e => setDesc(e.target.value)} minRows={1} />
 
             <div className="flex gap-2">
               <div className="flex-1">
@@ -2001,28 +2115,40 @@
     // ⚖️  SETTLEMENTS TAB
     // ══════════════════════════════════════════════════
     function SettlementsTab({ trip, members, expenses }) {
-      const [currency, setCurr]       = useState(trip.base_currency);
-      const [result, setResult]       = useState(null);
-      const [calculating, setCalc]    = useState(false);
+      const [currency, setCurr]    = useState(trip.base_currency);
+      const cacheKey               = `${trip.id}:${currency}`;
+      const [result, setResult]    = useState(_settleCache[cacheKey] || null);
+      // Only show the loading spinner on first load for this currency.
+      // On tab switch-back the cached result is shown immediately while
+      // a silent background recompute runs to pick up any new expenses.
+      const [calculating, setCalc] = useState(false);
+      const [rateError, setRateError] = useState('');
 
       const memberName = (id) => members.find(m => m.id === id)?.name || 'Unknown';
       const memberIdx  = (id) => members.findIndex(m => m.id === id);
 
-      const [rateError, setRateError] = useState('');
-
       const compute = useCallback(async () => {
         if (!members.length) return;
-        setCalc(true);
+        const key = `${trip.id}:${currency}`;
+        const hasCache = !!_settleCache[key];
+        if (!hasCache) setCalc(true);  // spinner only on first load per currency
         setRateError('');
         try {
           const r = await computeSettlements(expenses, members, currency);
+          _settleCache[key] = r;
           setResult(r);
         } catch(e) {
           setRateError(e.message || 'Could not fetch exchange rates.');
         } finally {
           setCalc(false);
         }
-      }, [expenses, members, currency]);
+      }, [expenses, members, currency, trip.id]);
+
+      // Sync result state when currency changes (show cached value if available)
+      useEffect(() => {
+        const key = `${trip.id}:${currency}`;
+        if (_settleCache[key]) setResult(_settleCache[key]);
+      }, [currency, trip.id]);
 
       useEffect(() => { compute(); }, [compute]);
 
@@ -2336,7 +2462,7 @@
         <Modal title="Edit Trip" onClose={onClose}>
           <div className="space-y-4">
             <TextInput label="Trip name *" value={name} onChange={e => setName(e.target.value)} />
-            <TextInput label="Description" value={desc} onChange={e => setDesc(e.target.value)} />
+            <TextArea label="Description" value={desc} onChange={e => setDesc(e.target.value)} minRows={2} />
             <div className="grid grid-cols-2 gap-3">
               <SelectInput label="Default expense currency" value={expCurr} onChange={e => setExpCurr(e.target.value)}>
                 {CURRENCIES.map(c => <option key={c}>{c}</option>)}
@@ -2352,6 +2478,60 @@
             </div>
           </div>
         </Modal>
+      );
+    }
+
+    // ══════════════════════════════════════════════════
+    // 🔑  PASSWORD RECOVERY VIEW
+    // Shown when user arrives via a password-reset email link.
+    // detectSessionInUrl is false, so we manually parse the URL
+    // hash for the recovery token and call setSession() ourselves.
+    // ══════════════════════════════════════════════════
+    function PasswordRecoveryView({ onDone }) {
+      const [newPass, setNewPass]     = useState('');
+      const [confirmPass, setConfirm] = useState('');
+      const [err, setErr]             = useState('');
+      const [ok, setOk]               = useState('');
+      const [loading, setLoad]        = useState(false);
+
+      const submit = async () => {
+        setErr(''); setOk('');
+        if (newPass.length < 6)      { setErr('Password must be at least 6 characters.'); return; }
+        if (newPass !== confirmPass)  { setErr('Passwords do not match.'); return; }
+        setLoad(true);
+        try {
+          const { error } = await db.auth.updateUser({ password: newPass });
+          if (error) throw error;
+          setOk('Password updated! Taking you to sign in…');
+          setTimeout(onDone, 2000);
+        } catch(e) { setErr(e?.message || 'Could not update password.'); }
+        setLoad(false);
+      };
+
+      return (
+        <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-cream">
+          <div className="w-full max-w-sm fade-up">
+            <div className="text-center mb-8">
+              <div className="w-14 h-14 bg-ink rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-lg">
+                <i className="fa-solid fa-lock-open text-gold text-xl" />
+              </div>
+              <h1 className="text-2xl font-bold text-ink tracking-tight">Set New Password</h1>
+              <p className="text-sm text-muted mt-1">Choose a new password for your account.</p>
+            </div>
+            <div className="bg-white rounded-2xl border border-ink/8 p-6 shadow-sm space-y-4">
+              <TextInput label="New password" type="password" placeholder="Min. 6 characters"
+                value={newPass} onChange={e => setNewPass(e.target.value)} />
+              <TextInput label="Confirm new password" type="password" placeholder="Repeat password"
+                value={confirmPass} onChange={e => setConfirm(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && submit()} />
+              {err && <Toast message={err} />}
+              {ok  && <Toast message={ok} type="success" />}
+              <Btn variant="gold" full loading={loading} onClick={submit}>
+                Update Password
+              </Btn>
+            </div>
+          </div>
+        </div>
       );
     }
 
