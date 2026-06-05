@@ -1519,9 +1519,28 @@
         return t;
       }, [expenses]);
 
+      // Balance in trip base currency using full FX conversion — same engine as
+      // Settle Up tab. Uses _settleCache so if Settle Up was already visited the
+      // result is instant. Otherwise fetches rates silently in the background.
+      const [settleResult, setSettleResult] = useState(
+        () => _settleCache[`${trip.id}:${trip.base_currency}`] || null
+      );
+      const [balanceLoading, setBalanceLoading] = useState(false);
+
+      useEffect(() => {
+        if (!expenses.length || !members.length) return;
+        const key = `${trip.id}:${trip.base_currency}`;
+        if (_settleCache[key]) { setSettleResult(_settleCache[key]); return; }
+        setBalanceLoading(true);
+        computeSettlements(expenses, members, trip.base_currency)
+          .then(r => { cacheSet(_settleCache, _settleCacheKeys, key, r, 20); setSettleResult(r); })
+          .catch(() => {})
+          .finally(() => setBalanceLoading(false));
+      }, [expenses, members, trip.id, trip.base_currency]);
+
       return (
         <div className="pb-24">
-          {/* Summary pill */}
+          {/* Summary pills */}
           {expenses.length > 0 && (
             <div className="flex flex-wrap gap-2 mb-4">
               {Object.entries(totals).map(([c, amt]) => (
@@ -1532,6 +1551,30 @@
               <div className="bg-white rounded-full border border-ink/8 px-3 py-1.5 text-xs font-semibold text-muted">
                 {expenses.length} {expenses.length === 1 ? 'expense' : 'expenses'}
               </div>
+              {(() => {
+                const myMember = members.find(m => m.user_id === user.id);
+                if (!myMember) return null;
+                if (balanceLoading) return (
+                  <div className="bg-parchment rounded-full border border-ink/8 px-3 py-1.5 text-xs font-semibold text-muted flex items-center gap-1.5">
+                    <Spinner /> Calculating…
+                  </div>
+                );
+                if (!settleResult) return null;
+                const bal = settleResult.balances[myMember.id] ?? 0;
+                const isOwed = bal > 0.005;
+                const isOwe  = bal < -0.005;
+                const cls = isOwed ? 'bg-moss-light text-moss border-moss/20'
+                          : isOwe  ? 'bg-rose-light text-rose border-rose/20'
+                          : 'bg-parchment text-muted border-ink/8';
+                const label = isOwed ? `Owed ${fmt(bal, trip.base_currency)}`
+                            : isOwe  ? `Owe ${fmt(Math.abs(bal), trip.base_currency)}`
+                            : 'Settled';
+                return (
+                  <div className={`rounded-full border px-3 py-1.5 text-xs font-semibold ${cls}`}>
+                    {label}
+                  </div>
+                );
+              })()}
             </div>
           )}
 
