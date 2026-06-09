@@ -261,7 +261,7 @@
     // 🧮  SETTLEMENT ALGORITHM
     // Returns: { settlements: [{from,to,amount}], balances: {memberId: number} }
     // ══════════════════════════════════════════════════
-    async function computeSettlements(expenses, members, baseCurrency) {
+    async function computeSettlements(expenses, members, baseCurrency, confirmedPayments = []) {
       const balances = {};
       members.forEach(m => { balances[m.id] = 0; });
       let totalSpend = 0;
@@ -283,6 +283,20 @@
             balances[split.member_id] -= splitBase;
           }
         }
+      }
+
+      // Apply confirmed payments — reduce balances without affecting total spend
+      for (const pmt of confirmedPayments) {
+        let rate = 1;
+        if (pmt.currency !== baseCurrency) {
+          try {
+            const date = pmt.confirmed_at ? pmt.confirmed_at.split('T')[0] : todayISO();
+            rate = await getRate(pmt.currency, baseCurrency, date);
+          } catch { /* use rate 1 as fallback */ }
+        }
+        const converted = pmt.amount * rate;
+        if (balances[pmt.from_member_id] !== undefined) balances[pmt.from_member_id] += converted;
+        if (balances[pmt.to_member_id]   !== undefined) balances[pmt.to_member_id]   -= converted;
       }
 
       // Round balances and total
@@ -473,6 +487,43 @@
       // transaction so a dropped connection can never leave them out of sync.
       const { error } = await withTimeout(() => db.rpc('update_profile_name', { new_name: name }));
       if (error) { logErr('updateProfileName', error); throw error; }
+    }
+
+    // ══════════════════════════════════════════════════
+    // 💸  PAYMENT HELPERS
+    // Payments are permanent records of real money transfers,
+    // independent of computed settlements.
+    // ══════════════════════════════════════════════════
+    async function fetchPayments(tripId) {
+      const { data, error } = await withTimeout(() => db
+        .from('payments').select('*').eq('trip_id', tripId)
+        .order('created_at', { ascending: false }));
+      if (error) { logErr('fetchPayments', error); throw error; }
+      return data || [];
+    }
+
+    async function createPayment({ tripId, fromMemberId, toMemberId, amount, currency, userId }) {
+      const { data, error } = await withTimeout(() => db
+        .from('payments')
+        .insert({ trip_id: tripId, from_member_id: fromMemberId, to_member_id: toMemberId,
+                  amount, currency, initiated_by: userId })
+        .select().single());
+      if (error) { logErr('createPayment', error); throw error; }
+      return data;
+    }
+
+    async function confirmPayment(paymentId, userId) {
+      const { error } = await withTimeout(() => db
+        .from('payments')
+        .update({ status: 'confirmed', confirmed_by: userId, confirmed_at: new Date().toISOString() })
+        .eq('id', paymentId).eq('status', 'pending'));
+      if (error) { logErr('confirmPayment', error); throw error; }
+    }
+
+    async function cancelPayment(paymentId) {
+      const { error } = await withTimeout(() => db
+        .from('payments').delete().eq('id', paymentId));
+      if (error) { logErr('cancelPayment', error); throw error; }
     }
 
     // ══════════════════════════════════════════════════
@@ -1326,6 +1377,7 @@
       const [tab, setTab]           = useState('expenses');
       const [members, setMembers]   = useState([]);
       const [expenses, setExpenses] = useState([]);
+      const [payments, setPayments] = useState([]);
       const [loading, setLoading]   = useState(true);
       const [loadError, setLoadError] = useState('');
       const [showEditTrip, setEditTrip] = useState(false);
@@ -1339,9 +1391,10 @@
         setLoading(true);
         setLoadError('');
         try {
-          const [m, e] = await Promise.all([
+          const [m, e, p] = await Promise.all([
             fetchTripMembers(trip.id),
             fetchExpenses(trip.id),
+            fetchPayments(trip.id),
           ]);
           // Check the current user is actually a member of this trip
           const isMember = m.some(member => member.user_id === user.id) || trip.created_by === user.id;
@@ -1351,12 +1404,30 @@
           }
           setMembers(m);
           setExpenses(e);
+          setPayments(p);
         } catch (e) {
           console.error('Failed to load trip data:', e);
           setLoadError(e?.message || 'Could not load trip data.');
         } finally {
           setLoading(false);
         }
+      }, [trip.id]);
+
+      // Cheap refresh — only re-fetches payments and invalidates the settle
+      // cache so balance pills recompute. Used after payment create/confirm/cancel
+      // to avoid re-fetching members and expenses unnecessarily.
+      const loadPayments = useCallback(async () => {
+        try {
+          const p = await fetchPayments(trip.id);
+          setPayments(p);
+          const prefix = trip.id + ':';
+          const stale = _settleCacheKeys.filter(k => k.startsWith(prefix));
+          stale.forEach(k => { delete _settleCache[k]; });
+          stale.forEach(k => {
+            const idx = _settleCacheKeys.indexOf(k);
+            if (idx > -1) _settleCacheKeys.splice(idx, 1);
+          });
+        } catch(e) { logErr('loadPayments', e); }
       }, [trip.id]);
 
       useEffect(() => { load(); }, [load]);
@@ -1476,8 +1547,8 @@
               </div>
             ) : (
               <>
-                {tab === 'expenses'    && <ExpensesTab    trip={trip} members={members} expenses={expenses} user={user} onRefresh={load} />}
-                {tab === 'settlements' && <SettlementsTab trip={trip} members={members} expenses={expenses} />}
+                {tab === 'expenses'    && <ExpensesTab    trip={trip} members={members} expenses={expenses} payments={payments} user={user} onRefresh={load} onPaymentRefresh={loadPayments} />}
+                {tab === 'settlements' && <SettlementsTab trip={trip} members={members} expenses={expenses} payments={payments} user={user} onRefresh={load} onPaymentRefresh={loadPayments} />}
                 {tab === 'people'      && <PeopleTab      trip={trip} members={members} user={user} isCreator={isCreator} onRefresh={load} />}
               </>
             )}
@@ -1487,9 +1558,92 @@
     }
 
     // ══════════════════════════════════════════════════
+    // 💳  PAYMENT CARD
+    // Shows a recorded payment in the expense list.
+    // Green = confirmed, amber = pending confirmation.
+    // ══════════════════════════════════════════════════
+    function PaymentCard({ payment, members, user, onPaymentRefresh }) {
+      const [acting, setActing] = useState(false);
+      const [err, setErr]       = useState('');
+
+      const fromM  = members.find(m => m.id === payment.from_member_id);
+      const toM    = members.find(m => m.id === payment.to_member_id);
+      const myM    = members.find(m => m.user_id === user.id);
+      const iInitiated = payment.initiated_by === user.id;
+      const iNeedToConfirm = !iInitiated && myM &&
+        (payment.from_member_id === myM.id || payment.to_member_id === myM.id);
+
+      const confirmed = payment.status === 'confirmed';
+
+      const handleConfirm = async () => {
+        setActing(true); setErr('');
+        try { await confirmPayment(payment.id, user.id); await onPaymentRefresh(); }
+        catch(e) { setErr(e?.message || 'Could not confirm payment.'); }
+        setActing(false);
+      };
+      const handleCancel = async () => {
+        setActing(true); setErr('');
+        try { await cancelPayment(payment.id); await onPaymentRefresh(); }
+        catch(e) { setErr(e?.message || 'Could not cancel payment.'); }
+        setActing(false);
+      };
+
+      const bg  = confirmed ? 'bg-moss-light border-moss/20' : 'bg-gold/8 border-gold/20';
+      const dot = confirmed ? 'bg-moss' : 'bg-gold';
+
+      return (
+        <div className={`rounded-2xl border p-4 ${bg}`}>
+          <div className="flex items-center gap-3">
+            <div className={`w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 ${confirmed ? 'bg-moss/15' : 'bg-gold/15'}`}>
+              <i className={`fa-solid fa-money-bill-transfer text-sm ${confirmed ? 'text-moss' : 'text-gold'}`} />
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-semibold text-ink truncate">
+                {fromM?.name || 'Someone'} → {toM?.name || 'Someone'}
+              </p>
+              <div className="flex items-center gap-1.5 mt-0.5">
+                <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${dot}`} />
+                <p className="text-xs text-muted">
+                  {confirmed ? 'Payment confirmed' : 'Awaiting confirmation'}
+                </p>
+              </div>
+            </div>
+            <p className={`font-bold text-sm flex-shrink-0 ${confirmed ? 'text-moss' : 'text-gold'}`}>
+              {fmt(payment.amount, payment.currency)}
+            </p>
+          </div>
+          {/* Action row */}
+          {!confirmed && (
+            <div className="mt-3 pt-3 border-t border-black/5 space-y-2">
+              <div className="flex items-center gap-2">
+                {iNeedToConfirm ? (
+                  <>
+                    <p className="text-xs text-muted flex-1">
+                      {fromM?.name} says they paid — did you receive it?
+                    </p>
+                    <Btn sm variant="gold" loading={acting} onClick={handleConfirm}>Confirm</Btn>
+                    <Btn sm variant="ghost" loading={acting} onClick={handleCancel}>Reject</Btn>
+                  </>
+                ) : iInitiated ? (
+                  <>
+                    <p className="text-xs text-muted flex-1">Waiting for {toM?.name} to confirm</p>
+                    <Btn sm variant="ghost" loading={acting} onClick={handleCancel}>Cancel</Btn>
+                  </>
+                ) : (
+                  <p className="text-xs text-muted">Waiting for confirmation between {fromM?.name} and {toM?.name}</p>
+                )}
+              </div>
+              {err && <Toast message={err} />}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ══════════════════════════════════════════════════
     // 💸  EXPENSES TAB
     // ══════════════════════════════════════════════════
-    function ExpensesTab({ trip, members, expenses, user, onRefresh }) {
+    function ExpensesTab({ trip, members, expenses, payments, user, onRefresh, onPaymentRefresh }) {
       const [showAdd, setAdd]   = useState(false);
       const [editExp, setEdit]  = useState(null);
       const [deleting, setDel]  = useState(null);
@@ -1505,15 +1659,20 @@
         catch (e) { setDeleteErr(e?.message || 'Delete failed.'); setDel(null); }
       };
 
-      // Group by date
+      // Group expenses and payments together by date
       const grouped = useMemo(() => {
         const g = {};
         expenses.forEach(e => {
           if (!g[e.date]) g[e.date] = [];
-          g[e.date].push(e);
+          g[e.date].push({ type: 'expense', data: e });
+        });
+        (payments || []).forEach(p => {
+          const date = p.created_at.split('T')[0];
+          if (!g[date]) g[date] = [];
+          g[date].push({ type: 'payment', data: p });
         });
         return Object.entries(g).sort(([a], [b]) => b.localeCompare(a));
-      }, [expenses]);
+      }, [expenses, payments]);
 
       // Total spend and balance in trip base currency — computed together via
       // computeSettlements so FX rates are only fetched once. Always exactly
@@ -1526,13 +1685,14 @@
       useEffect(() => {
         if (!expenses.length || !members.length) return;
         const key = `${trip.id}:${trip.base_currency}`;
-        if (_settleCache[key]) { setSettleResult(_settleCache[key]); return; }
-        setBalanceLoading(true);
-        computeSettlements(expenses, members, trip.base_currency)
+        const hasCache = !!_settleCache[key];
+        if (!hasCache) setBalanceLoading(true);
+        const confirmedPayments = (payments || []).filter(p => p.status === 'confirmed');
+        computeSettlements(expenses, members, trip.base_currency, confirmedPayments)
           .then(r => { cacheSet(_settleCache, _settleCacheKeys, key, r, 20); setSettleResult(r); })
           .catch(() => {})
           .finally(() => setBalanceLoading(false));
-      }, [expenses, members, trip.id, trip.base_currency]);
+      }, [expenses, members, trip.id, trip.base_currency, payments]);
 
       return (
         <div className="pb-24">
@@ -1584,24 +1744,25 @@
             </div>
           ) : (
             <div className="space-y-5">
-              {grouped.map(([date, dayExps]) => (
+              {grouped.map(([date, dayItems]) => (
                 <div key={date}>
                   <p className="text-xs font-semibold text-muted uppercase tracking-widest mb-2 px-1">
                     {fmtDateGroup(date)}
                   </p>
                   <div className="space-y-2">
-                    {dayExps.map(exp => (
-                      <ExpenseCard key={exp.id} expense={exp}
-                        memberName={memberName} memberIdx={memberIdx}
-                        members={members}
-                        userId={user.id}
-                        onEdit={() => setEdit(exp)}
-                        onDelete={() => handleDelete(exp.id)}
-                        onConfirmDelete={() => setConf(exp.id)}
-                        onCancelDelete={() => setConf(null)}
-                        onConfirm={confirmDel === exp.id}
-                        deleting={deleting === exp.id} />
-                    ))}
+                    {dayItems.map(item => item.type === 'payment'
+                      ? <PaymentCard key={item.data.id} payment={item.data}
+                          members={members} user={user} onPaymentRefresh={onPaymentRefresh} />
+                      : <ExpenseCard key={item.data.id} expense={item.data}
+                          memberName={memberName} memberIdx={memberIdx}
+                          members={members} userId={user.id}
+                          onEdit={() => setEdit(item.data)}
+                          onDelete={() => handleDelete(item.data.id)}
+                          onConfirmDelete={() => setConf(item.data.id)}
+                          onCancelDelete={() => setConf(null)}
+                          onConfirm={confirmDel === item.data.id}
+                          deleting={deleting === item.data.id} />
+                    )}
                   </div>
                 </div>
               ))}
@@ -2199,30 +2360,32 @@
       );
     }
 
-    // ══════════════════════════════════════════════════
-    // ⚖️  SETTLEMENTS TAB
-    // ══════════════════════════════════════════════════
-    function SettlementsTab({ trip, members, expenses }) {
+    function SettlementsTab({ trip, members, expenses, payments, user, onRefresh, onPaymentRefresh }) {
       const [currency, setCurr]    = useState(trip.base_currency);
       const cacheKey               = `${trip.id}:${currency}`;
+      const confirmedPayments      = useMemo(() => (payments || []).filter(p => p.status === 'confirmed'), [payments]);
       const [result, setResult]    = useState(_settleCache[cacheKey] || null);
-      // Only show the loading spinner on first load for this currency.
-      // On tab switch-back the cached result is shown immediately while
-      // a silent background recompute runs to pick up any new expenses.
       const [calculating, setCalc] = useState(false);
       const [rateError, setRateError] = useState('');
 
-      const memberName = (id) => members.find(m => m.id === id)?.name || 'Unknown';
-      const memberIdx  = (id) => members.findIndex(m => m.id === id);
+      // Mark-as-paid state
+      const [payingTxn, setPayingTxn] = useState(null); // { from, to, amount }
+      const [payAmt, setPayAmt]       = useState('');
+      const [paying, setPaying]       = useState(false);
+      const [payErr, setPayErr]       = useState('');
+
+      const myMember    = members.find(m => m.user_id === user.id);
+      const memberName  = (id) => members.find(m => m.id === id)?.name || 'Unknown';
+      const memberIdx   = (id) => members.findIndex(m => m.id === id);
 
       const compute = useCallback(async () => {
         if (!members.length) return;
         const key = `${trip.id}:${currency}`;
         const hasCache = !!_settleCache[key];
-        if (!hasCache) setCalc(true);  // spinner only on first load per currency
+        if (!hasCache) setCalc(true);
         setRateError('');
         try {
-          const r = await computeSettlements(expenses, members, currency);
+          const r = await computeSettlements(expenses, members, currency, confirmedPayments);
           cacheSet(_settleCache, _settleCacheKeys, key, r, 20);
           setResult(r);
         } catch(e) {
@@ -2230,9 +2393,8 @@
         } finally {
           setCalc(false);
         }
-      }, [expenses, members, currency, trip.id]);
+      }, [expenses, members, currency, trip.id, confirmedPayments]);
 
-      // Sync result state when currency changes (show cached value if available)
       useEffect(() => {
         const key = `${trip.id}:${currency}`;
         if (_settleCache[key]) setResult(_settleCache[key]);
@@ -2240,8 +2402,51 @@
 
       useEffect(() => { compute(); }, [compute]);
 
+      const startPay = (txn) => {
+        setPayingTxn(txn);
+        setPayAmt(fmtAmt(txn.amount));
+        setPayErr('');
+      };
+
+      const submitPayment = async () => {
+        const amt = parseAmt(payAmt);
+        if (!amt || amt <= 0) { setPayErr('Enter a valid amount.'); return; }
+        if (!myMember) return;
+        setPaying(true); setPayErr('');
+        try {
+          await createPayment({
+            tripId: trip.id,
+            fromMemberId: payingTxn.from,
+            toMemberId: payingTxn.to,
+            amount: amt,
+            currency,
+            userId: user.id,
+          });
+          setPayingTxn(null);
+          await onPaymentRefresh();
+        } catch(e) { setPayErr(e?.message || 'Could not record payment.'); }
+        setPaying(false);
+      };
+
+      // Pending payments relevant to current user
+      const myPending = useMemo(() => (payments || []).filter(p =>
+        p.status === 'pending' && myMember &&
+        (p.from_member_id === myMember.id || p.to_member_id === myMember.id)
+      ), [payments, myMember]);
+
       return (
         <div className="space-y-4 pb-8">
+
+          {/* Pending confirmations banner */}
+          {myPending.length > 0 && (
+            <div className="space-y-2">
+              <p className="text-xs font-semibold text-muted uppercase tracking-widest px-1">Pending confirmation</p>
+              {myPending.map(p => (
+                <PaymentCard key={p.id} payment={p} members={members} user={user} onPaymentRefresh={onPaymentRefresh} />
+              ))}
+            </div>
+          )}
+
           {/* Currency chooser */}
           <div className="bg-white rounded-2xl border border-ink/8 p-4">
             <div className="flex items-center gap-3">
@@ -2268,9 +2473,7 @@
                 <div>
                   <p className="text-sm font-semibold text-ink">Exchange rate error</p>
                   <p className="text-xs text-muted mt-1">{rateError}</p>
-                  <button onClick={compute} className="text-xs font-semibold text-rose hover:text-rose/70 mt-2 transition">
-                    Try again
-                  </button>
+                  <button onClick={compute} className="text-xs font-semibold text-rose hover:text-rose/70 mt-2 transition">Try again</button>
                 </div>
               </div>
             </div>
@@ -2310,20 +2513,74 @@
                   </div>
                 ) : (
                   <div className="space-y-2">
-                    {result.settlements.map((txn, i) => (
-                      <div key={i} className="bg-white rounded-2xl border border-ink/8 p-4 flex items-center gap-3">
-                        <Avatar name={memberName(txn.from)} idx={memberIdx(txn.from)} />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm text-ink">
-                            <span className="font-bold">{memberName(txn.from)}</span>
-                            <span className="text-muted"> → </span>
-                            <span className="font-bold">{memberName(txn.to)}</span>
-                          </p>
+                    {result.settlements.map((txn, i) => {
+                      const isFromMe = myMember?.id === txn.from;
+                      const isToMe   = myMember?.id === txn.to;
+                      const isInvolved = isFromMe || isToMe;
+                      const isPaying = payingTxn?.from === txn.from && payingTxn?.to === txn.to;
+                      const existingPending = (payments || []).find(p =>
+                        p.status === 'pending' &&
+                        p.from_member_id === txn.from &&
+                        p.to_member_id === txn.to
+                      );
+
+                      return (
+                        <div key={i} className="bg-white rounded-2xl border border-ink/8 p-4">
+                          {/* Main row */}
+                          <div className="flex items-center gap-3">
+                            <Avatar name={memberName(txn.from)} idx={memberIdx(txn.from)} />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm text-ink">
+                                <span className="font-bold">{isFromMe ? 'You' : memberName(txn.from)}</span>
+                                <span className="text-muted"> → </span>
+                                <span className="font-bold">{isToMe ? 'you' : memberName(txn.to)}</span>
+                              </p>
+                            </div>
+                            <p className="font-bold text-gold text-base flex-shrink-0">{fmt(txn.amount, currency)}</p>
+                            <Avatar name={memberName(txn.to)} idx={memberIdx(txn.to)} />
+                          </div>
+
+                          {/* Action area */}
+                          {isInvolved && !existingPending && !isPaying && (
+                            <div className="mt-3 pt-3 border-t border-parchment">
+                              <button onClick={() => startPay(txn)}
+                                className="w-full flex items-center justify-center gap-2 py-1.5 text-xs font-semibold text-gold hover:text-gold-dark transition">
+                                <i className="fa-solid fa-check" />
+                                {isFromMe ? "I've paid this" : "Mark as received"}
+                              </button>
+                            </div>
+                          )}
+
+                          {/* Inline pay form */}
+                          {isPaying && (
+                            <div className="mt-3 pt-3 border-t border-parchment space-y-2">
+                              <p className="text-xs text-muted">Confirm amount paid in {currency}:</p>
+                              <div className="flex gap-2">
+                                <input
+                                  type="text" inputMode="decimal"
+                                  value={payAmt}
+                                  onChange={e => setPayAmt(e.target.value)}
+                                  className="flex-1 px-3 py-2 bg-parchment border border-ink/12 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-gold/40"
+                                />
+                                <Btn sm variant="gold" loading={paying} onClick={submitPayment}>Confirm</Btn>
+                                <Btn sm variant="ghost" onClick={() => { setPayingTxn(null); setPayErr(''); }}>Cancel</Btn>
+                              </div>
+                              {payErr && <Toast message={payErr} />}
+                            </div>
+                          )}
+
+                          {/* Existing pending payment */}
+                          {existingPending && !isPaying && (
+                            <div className="mt-3 pt-3 border-t border-parchment">
+                              <p className="text-xs text-gold font-semibold flex items-center gap-1.5">
+                                <i className="fa-solid fa-clock" />
+                                Payment of {fmt(existingPending.amount, existingPending.currency)} pending confirmation
+                              </p>
+                            </div>
+                          )}
                         </div>
-                        <p className="font-bold text-gold text-base flex-shrink-0">{fmt(txn.amount, currency)}</p>
-                        <Avatar name={memberName(txn.to)} idx={memberIdx(txn.to)} />
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
