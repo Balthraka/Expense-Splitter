@@ -2063,20 +2063,18 @@
         [exacts]
       );
 
-      // Compute actual equal-split amounts including last-person rounding remainder
+      // Compute actual equal-split amounts using integer cent arithmetic to
+      // avoid floating point errors (e.g. 16.9 / 2 = 8.449999... not 8.45).
+      // Any genuine remainder (e.g. $10 / 3 = 3.33, 3.33, 3.34) goes to the last person.
       const equalAmounts = useMemo(() => {
-        if (total <= 0 || !equalSet.size) return {};
+        if (total <= 0 || !equalSet.size) return { amounts: {}, hasRemainder: false };
         const inc = members.filter(m => equalSet.has(m.id));
-        const share = Math.floor(total / inc.length * 100) / 100;
-        const out = {};
-        let running = 0;
-        inc.forEach((m, i) => {
-          const isLast = i === inc.length - 1;
-          const amt = isLast ? Math.round((total - running) * 100) / 100 : share;
-          out[m.id] = amt;
-          running += amt;
-        });
-        return out;
+        const totalCents = Math.round(total * 100);
+        const shareCents = Math.floor(totalCents / inc.length);
+        const hasRemainder = totalCents % inc.length !== 0;
+        const amounts = {};
+        inc.forEach(m => { amounts[m.id] = shareCents / 100; });
+        return { amounts, hasRemainder };
       }, [total, equalSet, members]);
 
       // Percentage mode: when a field changes, redistribute the remaining %
@@ -2134,14 +2132,17 @@
         if (splitType === 'equal') {
           const inc = members.filter(m => equalSet.has(m.id));
           if (!inc.length) return null;
-          const share = Math.floor(total / inc.length * 100) / 100;
-          let running = 0;
-          return inc.map((m, i) => {
-            const isLast = i === inc.length - 1;
-            const amt = isLast ? Math.round((total - running) * 100) / 100 : share;
-            running += amt;
-            return { memberId: m.id, amount: amt };
-          });
+          const totalCents = Math.round(total * 100);
+          const shareCents = Math.floor(totalCents / inc.length);
+          const remainder = totalCents - shareCents * inc.length;
+          // Start everyone at floor amount
+          const cents = {};
+          inc.forEach(m => { cents[m.id] = shareCents; });
+          // Distribute each extra cent to a different random person (no duplicates)
+          [...inc].sort(() => Math.random() - 0.5)
+            .slice(0, remainder)
+            .forEach(m => { cents[m.id] += 1; });
+          return inc.map(m => ({ memberId: m.id, amount: cents[m.id] / 100 }));
         }
         if (splitType === 'percent') {
           if (Math.abs(pctTotal - 100) > 0.1) return null;
@@ -2284,9 +2285,9 @@
                           }} className="w-4 h-4" />
                         <Avatar name={m.name} idx={i} size="sm" />
                         <span className="text-sm text-ink flex-1 font-medium">{m.name}</span>
-                        {total > 0 && equalSet.has(m.id) && equalAmounts[m.id] !== undefined && (
+                        {total > 0 && equalSet.has(m.id) && equalAmounts.amounts[m.id] !== undefined && (
                           <span className="text-xs text-muted font-semibold flex-shrink-0">
-                            {fmt(equalAmounts[m.id], currency)}
+                            {equalAmounts.hasRemainder ? '~' : ''}{fmt(equalAmounts.amounts[m.id], currency)}
                           </span>
                         )}
                       </label>
