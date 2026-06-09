@@ -1659,18 +1659,21 @@
         catch (e) { setDeleteErr(e?.message || 'Delete failed.'); setDel(null); }
       };
 
-      // Group expenses and payments together by date
+      // Group expenses and CONFIRMED payments together by date, sorted by time within each day.
+      // Pending payments are shown separately at the top so they're never missed.
       const grouped = useMemo(() => {
         const g = {};
         expenses.forEach(e => {
           if (!g[e.date]) g[e.date] = [];
-          g[e.date].push({ type: 'expense', data: e });
+          g[e.date].push({ type: 'expense', data: e, ts: new Date(e.created_at).getTime() });
         });
-        (payments || []).forEach(p => {
+        (payments || []).filter(p => p.status === 'confirmed').forEach(p => {
           const date = p.created_at.split('T')[0];
           if (!g[date]) g[date] = [];
-          g[date].push({ type: 'payment', data: p });
+          g[date].push({ type: 'payment', data: p, ts: new Date(p.created_at).getTime() });
         });
+        // Sort within each day newest-first
+        Object.values(g).forEach(items => items.sort((a, b) => b.ts - a.ts));
         return Object.entries(g).sort(([a], [b]) => b.localeCompare(a));
       }, [expenses, payments]);
 
@@ -1733,6 +1736,16 @@
                   </div>
                 );
               })()}
+            </div>
+          )}
+
+          {/* Pending payments float to top so they're never missed */}
+          {(payments || []).some(p => p.status === 'pending') && (
+            <div className="space-y-2 mb-2">
+              <p className="text-xs font-semibold text-muted uppercase tracking-widest px-1">Pending confirmation</p>
+              {(payments || []).filter(p => p.status === 'pending').map(p => (
+                <PaymentCard key={p.id} payment={p} members={members} user={user} onPaymentRefresh={onPaymentRefresh} />
+              ))}
             </div>
           )}
 
@@ -2555,14 +2568,17 @@
                           {isPaying && (
                             <div className="mt-3 pt-3 border-t border-parchment space-y-2">
                               <p className="text-xs text-muted">Confirm amount paid in {currency}:</p>
+                              <input
+                                type="text" inputMode="decimal"
+                                value={payAmt}
+                                onChange={e => {
+                                  const raw = e.target.value.replace(/,/g, '');
+                                  if (raw === '' || /^[\d.]*$/.test(raw)) setPayAmt(fmtAmt(raw));
+                                }}
+                                className="w-full px-3 py-2 bg-parchment border border-ink/12 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-gold/40"
+                              />
                               <div className="flex gap-2">
-                                <input
-                                  type="text" inputMode="decimal"
-                                  value={payAmt}
-                                  onChange={e => setPayAmt(e.target.value)}
-                                  className="flex-1 px-3 py-2 bg-parchment border border-ink/12 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-gold/40"
-                                />
-                                <Btn sm variant="gold" loading={paying} onClick={submitPayment}>Confirm</Btn>
+                                <Btn sm variant="gold" full loading={paying} onClick={submitPayment}>Confirm payment</Btn>
                                 <Btn sm variant="ghost" onClick={() => { setPayingTxn(null); setPayErr(''); }}>Cancel</Btn>
                               </div>
                               {payErr && <Toast message={payErr} />}
