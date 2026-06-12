@@ -1659,7 +1659,6 @@
         catch (e) { setDeleteErr(e?.message || 'Delete failed.'); setDel(null); }
       };
 
-      // Group expenses and CONFIRMED payments together by date, sorted by time within each day.
       // Pending payments are shown separately at the top so they're never missed.
       const grouped = useMemo(() => {
         const g = {};
@@ -1696,6 +1695,25 @@
           .catch(() => {})
           .finally(() => setBalanceLoading(false));
       }, [expenses, members, trip.id, trip.base_currency, payments]);
+
+      // Synchronously derive per-expense converted amounts from _ratesCache once
+      // rates are populated by the background settlement calculation.
+      // Zero extra API calls — only uses what's already cached.
+      const conversions = useMemo(() => {
+        if (!settleResult) return {};
+        const today = todayISO();
+        const result = {};
+        expenses.forEach(e => {
+          if (e.currency === trip.base_currency) return;
+          const fromL = e.currency.toLowerCase();
+          const toL   = trip.base_currency.toLowerCase();
+          const apiDate  = e.date >= today ? 'latest' : e.date;
+          const cacheKey = `${fromL}@${apiDate}`;
+          const rate = _ratesCache[cacheKey]?.[toL];
+          if (rate) result[e.id] = Math.round(e.amount * rate * 100) / 100;
+        });
+        return result;
+      }, [settleResult, expenses, trip.base_currency]);
 
       return (
         <div className="pb-24">
@@ -1769,6 +1787,8 @@
                       : <ExpenseCard key={item.data.id} expense={item.data}
                           memberName={memberName} memberIdx={memberIdx}
                           members={members} userId={user.id}
+                          convertedAmount={conversions[item.data.id] ?? null}
+                          baseCurrency={trip.base_currency}
                           onEdit={() => setEdit(item.data)}
                           onDelete={() => handleDelete(item.data.id)}
                           onConfirmDelete={() => setConf(item.data.id)}
@@ -1812,7 +1832,7 @@
       );
     }
 
-    function ExpenseCard({ expense, memberName, memberIdx, members, userId, onEdit, onDelete, onConfirmDelete, onCancelDelete, onConfirm, deleting }) {
+    function ExpenseCard({ expense, memberName, memberIdx, members, userId, convertedAmount, baseCurrency, onEdit, onDelete, onConfirmDelete, onCancelDelete, onConfirm, deleting }) {
       const isOwner = expense.created_by === userId;
       const [open, setOpen] = useState(false);
       const payer = memberName(expense.paid_by_member_id);
@@ -1868,9 +1888,12 @@
                 {splitSummary && <p className="text-xs text-muted/85 mt-0.5">{splitSummary}</p>}
                 {addedBy && <p className="text-xs text-muted/65 mt-0.5">Added by {addedBy}</p>}
               </div>
-              <div className="text-right">
+              <div className="text-right flex-shrink-0">
                 <p className="font-bold text-ink">{fmt(expense.amount, expense.currency)}</p>
-                <p className="text-xs text-muted">{expense.currency}</p>
+                <p className="text-xs text-muted mt-0.5">{expense.currency}</p>
+                {convertedAmount != null && (
+                  <p className="text-xs text-muted/70 italic mt-0.5">({fmt(convertedAmount, baseCurrency)})</p>
+                )}
               </div>
               <i className={`fa-solid fa-chevron-down text-muted text-xs transition-transform ${open ? 'rotate-180' : ''}`} />
             </div>
