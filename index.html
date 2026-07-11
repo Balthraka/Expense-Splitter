@@ -1570,8 +1570,23 @@
       const toM    = members.find(m => m.id === payment.to_member_id);
       const myM    = members.find(m => m.user_id === user.id);
       const iInitiated = payment.initiated_by === user.id;
-      const iNeedToConfirm = !iInitiated && myM &&
-        (payment.from_member_id === myM.id || payment.to_member_id === myM.id);
+
+      // If either party is an offline member (no account), any trip member
+      // can confirm on their behalf — including the initiator, since mutual
+      // confirmation isn't possible when one party has no account.
+      const offlineMemberInvolved = fromM?.user_id == null || toM?.user_id == null;
+      const iNeedToConfirm = myM && (
+        offlineMemberInvolved
+          ? (payment.from_member_id === myM.id || payment.to_member_id === myM.id || true)
+          : (!iInitiated && (payment.from_member_id === myM.id || payment.to_member_id === myM.id))
+      );
+
+      // Who are we confirming on behalf of?
+      const proxyFor = offlineMemberInvolved &&
+        payment.from_member_id !== myM?.id &&
+        payment.to_member_id   !== myM?.id
+          ? (toM?.user_id == null ? toM : fromM)
+          : null;
 
       const confirmed = payment.status === 'confirmed';
 
@@ -1619,7 +1634,9 @@
                 {iNeedToConfirm ? (
                   <>
                     <p className="text-xs text-muted flex-1">
-                      {fromM?.name} says they paid — did you receive it?
+                      {proxyFor
+                        ? `Confirm on behalf of ${proxyFor.name}`
+                        : `${fromM?.name} says they paid — did you receive it?`}
                     </p>
                     <Btn sm variant="ghost" loading={acting} onClick={handleCancel}>Reject</Btn>
                     <Btn sm variant="gold" loading={acting} onClick={handleConfirm}>Confirm</Btn>
